@@ -1,6 +1,6 @@
 # 📊 DCF Analyzer — Discounted Cash Flow Web App
 
-A Python/Streamlit web app that automatically calculates the intrinsic value of any publicly traded company using a Discounted Cash Flow model.
+A Python/Streamlit web app that automatically calculates the intrinsic value of any publicly traded company using a simple Discounted Cash Flow model.
 
 ## quick start
 
@@ -28,12 +28,13 @@ The app opens at `http://localhost:8501`.
 
 The app follows a standard DCF process:
 
-1. **Data Fetching** — Pulls financials from Yahoo Finance (income statement, balance sheet, cash flows)
+1. **Data Fetching** - Pulls financials from Yahoo Finance (income statement, balance sheet, cash flows)
 2. **FCF Extraction** — Calculates Free Cash Flow = Operating Cash Flow − CapEx
 3. **Growth Estimation** — Computes historical CAGR (or lets you override manually)
 4. **WACC Calculation** — Uses CAPM for cost of equity, blends with cost of debt
 5. **DCF Engine** — Projects FCFs, calculates terminal value (Gordon Growth), discounts to present
 6. **Sensitivity Analysis** — Shows how valuation changes across different assumptions
+7. **Historical DCF Replay** - core backtest with 1/2/3-year forward returns
 
 ## Features
 
