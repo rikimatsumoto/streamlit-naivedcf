@@ -57,6 +57,20 @@ def fetch_company_data(ticker: str) -> dict:
     }
 
 
+@st.cache_data(ttl=3600)
+def fetch_extended_history(ticker: str) -> pd.DataFrame:
+    """
+    Fetches up to 10 years of daily price history for backtesting.
+
+    We need a longer window than the 5y used for the main analysis because
+    backtest lookups may need prices from e.g. 7 years ago (fiscal year end)
+    plus 3-year forward returns from that point.
+    """
+    stock = yf.Ticker(ticker)
+    hist = stock.history(period="10y")
+    return hist
+
+
 # =============================================================================
 # SECTION 1b: RISK-FREE RATE (Live 10-Year Treasury Yield from FRED)
 # =============================================================================
@@ -587,23 +601,44 @@ def create_monte_carlo_chart(
         hovertemplate="Value: $%{x:,.2f}<br>Count: %{y}<extra></extra>",
     ))
 
-    # ---- Vertical reference lines ----
-    y_max = len(values) / 20  # Approximate bar height for annotation placement
+    # ---- Vertical reference lines with smart label placement ----
+    # When the market price and DCF value are close together, the default
+    # annotation positions overlap and become unreadable. We detect proximity
+    # and stagger the labels vertically (using yshift) to separate them.
+
+    # Determine how close the two lines are relative to the chart's x-range
+    x_range = max(values) - min(values) if len(values) > 1 else 1
+    separation = abs(base_intrinsic - current_price)
+    are_close = separation < (x_range * 0.12)  # Within ~12% of chart width
+
+    # Decide which line goes where:
+    # Place the left-most value's label on "top left", right-most on "top right"
+    # When close, stagger the right label downward with yshift
+    if current_price <= base_intrinsic:
+        price_pos, dcf_pos = "top left", "top right"
+        price_yshift, dcf_yshift = 0, (-30 if are_close else 0)
+    else:
+        price_pos, dcf_pos = "top right", "top left"
+        price_yshift, dcf_yshift = (-30 if are_close else 0), 0
 
     # Current market price (red dashed)
     fig.add_vline(
         x=current_price, line_dash="dash", line_color="#EF553B", line_width=2,
         annotation_text=f"Market Price: ${current_price:,.2f}",
-        annotation_position="top right",
+        annotation_position=price_pos,
         annotation_font_color="#EF553B",
+        annotation_font_size=11,
+        annotation_yshift=price_yshift,
     )
 
     # Base-case DCF value (green dashed)
     fig.add_vline(
         x=base_intrinsic, line_dash="dash", line_color="#00CC96", line_width=2,
         annotation_text=f"Base DCF: ${base_intrinsic:,.2f}",
-        annotation_position="top left",
+        annotation_position=dcf_pos,
         annotation_font_color="#00CC96",
+        annotation_font_size=11,
+        annotation_yshift=dcf_yshift,
     )
 
     # ---- 10th–90th percentile shading ----
@@ -612,7 +647,7 @@ def create_monte_carlo_chart(
         fillcolor="rgba(99, 110, 250, 0.08)",
         line_width=0,
         annotation_text="10th–90th Percentile",
-        annotation_position="top left",
+        annotation_position="bottom left",
         annotation_font_size=10,
         annotation_font_color="gray",
     )
@@ -622,10 +657,269 @@ def create_monte_carlo_chart(
         xaxis_title="Intrinsic Value Per Share ($)",
         yaxis_title="Frequency",
         template="plotly_white",
-        height=450,
+        height=480,
         showlegend=False,
         bargap=0.02,
+        margin=dict(t=80),  # Extra top margin for annotation labels
     )
+
+    return fig
+
+
+# =============================================================================
+# SECTION 5c: HISTORICAL DCF BACKTEST
+# =============================================================================
+
+def _get_price_near_date(history: pd.DataFrame, target_date: pd.Timestamp, window_days: int = 14) -> float | None:
+    """
+    Looks up the closing stock price nearest to a target date.
+
+    Because fiscal year-end dates may fall on weekends/holidays, we search
+    within a ±window_days window and return the closest available trading day.
+
+    Returns None if no price is found within the window.
+    """
+    if history.empty:
+        return None
+
+    # Ensure both are tz-naive for comparison
+    target = pd.Timestamp(target_date).tz_localize(None)
+    idx = history.index.tz_localize(None) if history.index.tz is not None else history.index
+
+    # Find trading days within the window
+    mask = (idx >= target - pd.Timedelta(days=window_days)) & \
+           (idx <= target + pd.Timedelta(days=window_days))
+    nearby = history.loc[mask]
+
+    if nearby.empty:
+        return None
+
+    # Pick the closest date to target
+    nearest_idx = (nearby.index.tz_localize(None) - target).map(abs).argmin()
+    return float(nearby["Close"].iloc[nearest_idx])
+
+
+def run_backtest(
+    fcf_series: pd.Series,
+    history: pd.DataFrame,
+    wacc: float,
+    terminal_growth_rate: float,
+    projection_years: int,
+    shares_outstanding: float,
+    net_debt: float,
+) -> list[dict]:
+    """
+    Historical DCF Replay — the core backtesting engine.
+
+    HOW IT WORKS:
+        For each fiscal year in the FCF series (where we have at least 2 prior
+        data points to estimate a growth rate), we pretend it's "today":
+
+        1. Use only FCF data available UP TO that year (no look-ahead bias)
+        2. Calculate the growth rate from the available historical FCFs
+        3. Run the DCF model with those inputs → intrinsic value per share
+        4. Look up the actual stock price at that fiscal year-end date
+        5. Look up stock prices 1, 2, and 3 years later
+        6. Calculate forward returns
+        7. Determine if the model's signal (buy/sell) was directionally correct
+
+    KNOWN LIMITATIONS (noted to the user in the UI):
+        - WACC is held constant (uses the current estimate) because Yahoo
+          only provides current-year balance sheet data. In reality, beta,
+          debt levels, and interest rates changed year to year.
+        - Shares outstanding and net debt are also held constant.
+        - Only ~4 years of annual financial data is available from Yahoo,
+          so we typically get 2-3 valid backtest points.
+
+    Returns:
+        A list of dicts, one per backtest year, each containing:
+        - fiscal_year: the year being backtested
+        - base_fcf: the FCF used as the starting point
+        - growth_rate: the estimated growth rate at that time
+        - intrinsic_value: the DCF intrinsic value per share
+        - market_price: the actual stock price at fiscal year-end
+        - signal: "Undervalued" or "Overvalued"
+        - upside_pct: % difference between intrinsic and market price
+        - fwd_return_1y/2y/3y: actual stock price returns over next 1/2/3 years
+        - signal_correct_1y/2y/3y: whether the directional signal was right
+    """
+    results = []
+
+    # We need at least 2 prior FCF data points to estimate growth,
+    # so we can backtest starting from the 3rd data point onward.
+    # We also skip the LAST data point (that's our current analysis, not a backtest).
+    #
+    # Example with 4 FCF years [2021, 2022, 2023, 2024]:
+    #   - Backtest 2022: growth from [2021, 2022], base = 2022 → only 2 points, marginal
+    #   - Backtest 2023: growth from [2021, 2022, 2023], base = 2023 → solid
+    #   - Skip 2024: that's the current analysis
+    if len(fcf_series) < 3:
+        return []  # Need at least 3 years: 2 for growth + 1 to backtest against
+
+    for i in range(1, len(fcf_series) - 1):
+        # "Pretend" this fiscal year-end is today
+        backtest_date = fcf_series.index[i]
+        fiscal_year = backtest_date.strftime("%Y")
+
+        # Step 1: FCF data available up to this point (no look-ahead)
+        available_fcfs = fcf_series.iloc[: i + 1]
+
+        # Step 2: Growth rate from available history
+        growth_rate = calculate_fcf_growth_rate(available_fcfs)
+        growth_rate = max(-0.10, min(growth_rate, 0.40))  # Same caps as main analysis
+
+        # Step 3: Run DCF
+        base_fcf = float(available_fcfs.iloc[-1])
+        dcf_result = run_dcf(
+            last_fcf=base_fcf,
+            growth_rate=growth_rate,
+            terminal_growth_rate=terminal_growth_rate,
+            wacc=wacc,
+            projection_years=projection_years,
+            shares_outstanding=shares_outstanding,
+            net_debt=net_debt,
+        )
+        intrinsic_value = dcf_result["intrinsic_value_per_share"]
+
+        # Step 4: Look up market price at fiscal year-end
+        market_price = _get_price_near_date(history, backtest_date)
+        if market_price is None or market_price <= 0:
+            continue  # Skip if we can't find a price
+
+        # Step 5: Signal
+        upside_pct = (intrinsic_value - market_price) / market_price * 100
+        signal = "Undervalued" if intrinsic_value > market_price else "Overvalued"
+
+        # Step 6: Forward returns (1, 2, 3 years after the backtest date)
+        forward_returns = {}
+        forward_prices = {}
+        signal_correct = {}
+
+        for years_fwd in [1, 2, 3]:
+            future_date = backtest_date + pd.DateOffset(years=years_fwd)
+            future_price = _get_price_near_date(history, future_date)
+
+            if future_price is not None and future_price > 0:
+                fwd_return = (future_price - market_price) / market_price * 100
+                forward_returns[f"fwd_return_{years_fwd}y"] = fwd_return
+                forward_prices[f"fwd_price_{years_fwd}y"] = future_price
+
+                # Was the signal correct?
+                # "Undervalued" is correct if the stock went UP
+                # "Overvalued" is correct if the stock went DOWN
+                if signal == "Undervalued":
+                    signal_correct[f"signal_correct_{years_fwd}y"] = fwd_return > 0
+                else:
+                    signal_correct[f"signal_correct_{years_fwd}y"] = fwd_return < 0
+            else:
+                forward_returns[f"fwd_return_{years_fwd}y"] = None
+                forward_prices[f"fwd_price_{years_fwd}y"] = None
+                signal_correct[f"signal_correct_{years_fwd}y"] = None
+
+        results.append({
+            "fiscal_year": fiscal_year,
+            "backtest_date": backtest_date,
+            "base_fcf": base_fcf,
+            "growth_rate": growth_rate,
+            "intrinsic_value": intrinsic_value,
+            "market_price": market_price,
+            "signal": signal,
+            "upside_pct": upside_pct,
+            **forward_returns,
+            **forward_prices,
+            **signal_correct,
+        })
+
+    return results
+
+
+def create_backtest_chart(backtest_results: list[dict], ticker: str) -> go.Figure:
+    """
+    Creates a grouped bar chart comparing DCF intrinsic value vs. actual market
+    price at each backtested fiscal year, with forward return annotations.
+    """
+    years = [r["fiscal_year"] for r in backtest_results]
+    intrinsics = [r["intrinsic_value"] for r in backtest_results]
+    prices = [r["market_price"] for r in backtest_results]
+
+    fig = go.Figure()
+
+    # Intrinsic value bars
+    fig.add_trace(go.Bar(
+        name="DCF Intrinsic Value",
+        x=years, y=intrinsics,
+        marker_color="#636EFA",
+        text=[f"${v:,.2f}" for v in intrinsics],
+        textposition="outside",
+    ))
+
+    # Market price bars
+    fig.add_trace(go.Bar(
+        name="Market Price (at FY end)",
+        x=years, y=prices,
+        marker_color="#EF553B",
+        text=[f"${v:,.2f}" for v in prices],
+        textposition="outside",
+    ))
+
+    fig.update_layout(
+        title=f"{ticker} — Historical DCF vs. Actual Market Price",
+        xaxis_title="Fiscal Year",
+        yaxis_title="Price Per Share ($)",
+        barmode="group",
+        template="plotly_white",
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    return fig
+
+
+def create_forward_returns_chart(backtest_results: list[dict], ticker: str) -> go.Figure:
+    """
+    Creates a chart showing actual forward returns after each backtest signal.
+
+    Each fiscal year gets a cluster of bars showing 1-year, 2-year, and 3-year
+    actual returns, colored green (positive) or red (negative).
+    """
+    fig = go.Figure()
+
+    years = [r["fiscal_year"] for r in backtest_results]
+
+    for period, label, color in [
+        ("fwd_return_1y", "1-Year Return", "#636EFA"),
+        ("fwd_return_2y", "2-Year Return", "#00CC96"),
+        ("fwd_return_3y", "3-Year Return", "#AB63FA"),
+    ]:
+        values = []
+        texts = []
+        for r in backtest_results:
+            val = r.get(period)
+            if val is not None:
+                values.append(val)
+                texts.append(f"{val:+.1f}%")
+            else:
+                values.append(None)
+                texts.append("N/A")
+
+        fig.add_trace(go.Bar(
+            name=label, x=years, y=values,
+            marker_color=color,
+            text=texts, textposition="outside",
+        ))
+
+    fig.update_layout(
+        title=f"{ticker} — Actual Forward Returns After Each Backtest",
+        xaxis_title="Fiscal Year (DCF run date)",
+        yaxis_title="Forward Return (%)",
+        barmode="group",
+        template="plotly_white",
+        height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+
+    # Add a zero line for clarity
+    fig.add_hline(y=0, line_dash="dot", line_color="gray", line_width=1)
 
     return fig
 
@@ -1161,11 +1455,12 @@ def main():
         upside = ((intrinsic - current_price) / current_price * 100) if current_price > 0 else 0
 
         # ================================================================
-        # TABS: Analysis | Monte Carlo | Appendix
+        # TABS: Analysis | Monte Carlo | Backtest | Appendix
         # ================================================================
-        tab_analysis, tab_monte_carlo, tab_appendix = st.tabs([
+        tab_analysis, tab_monte_carlo, tab_backtest, tab_appendix = st.tabs([
             "📊 Analysis",
             "🎲 Monte Carlo Simulation",
+            "🔬 Backtest",
             "📑 Appendix — Full Calculation",
         ])
 
@@ -1405,7 +1700,133 @@ The Monte Carlo simulation sampled each input from a normal distribution:
 WACC and terminal growth use fixed uncertainty bands.*
                     """)
 
-        # ---- TAB 2: APPENDIX (full step-by-step walkthrough) ----
+        # ---- TAB 3: BACKTEST ----
+        with tab_backtest:
+            st.subheader("🔬 Historical DCF Replay")
+            st.markdown(
+                "This backtest asks: **if you had run this exact DCF model at the end of each "
+                "past fiscal year, using only data available at the time, would the signal "
+                "have been correct?**"
+            )
+
+            # Fetch extended price history for forward return lookups
+            with st.spinner("Fetching extended price history for backtesting..."):
+                try:
+                    extended_hist = fetch_extended_history(ticker)
+                except Exception:
+                    extended_hist = data["history"]  # Fallback to 5y
+
+            backtest_results = run_backtest(
+                fcf_series=fcf_series,
+                history=extended_hist,
+                wacc=wacc_data["wacc"],
+                terminal_growth_rate=terminal_growth_rate,
+                projection_years=projection_years,
+                shares_outstanding=shares,
+                net_debt=net_debt,
+            )
+
+            if not backtest_results:
+                st.warning(
+                    "Not enough historical data to run a backtest. At least 3 years of "
+                    "FCF data are needed (2 for growth estimation + 1 to test against)."
+                )
+            else:
+                # ---- Limitations callout ----
+                with st.expander("⚠️ Backtest Limitations — read before interpreting results"):
+                    st.markdown("""
+**What this backtest does well:**
+- Tests the FCF growth assumption using only data available at the time (no look-ahead bias on FCFs)
+- Compares model signals against actual subsequent stock performance
+
+**Known simplifications:**
+- **WACC is held constant** — uses today's estimate for all backtest years. In reality, beta, interest rates, and debt levels change over time. This means the discount rate may not reflect the conditions at each historical point.
+- **Shares outstanding and net debt** are also held constant at current values.
+- **Yahoo Finance provides only ~4 years** of annual financials, limiting us to 2-3 backtest points.
+- A stock going up/down doesn't necessarily validate/invalidate a DCF — markets can stay irrational. Treat this as a directional sanity check, not proof.
+                    """)
+
+                # ---- Results Table ----
+                st.subheader("📋 Backtest Results")
+
+                for r in backtest_results:
+                    signal_emoji = "📗" if r["signal"] == "Undervalued" else "📕"
+                    with st.container(border=True):
+                        st.markdown(f"### FY {r['fiscal_year']} — {signal_emoji} Model said: **{r['signal']}** ({r['upside_pct']:+.1f}%)")
+
+                        bcol1, bcol2, bcol3 = st.columns(3)
+                        bcol1.metric("DCF Intrinsic Value", f"${r['intrinsic_value']:,.2f}")
+                        bcol2.metric("Market Price (at FY end)", f"${r['market_price']:,.2f}")
+                        bcol3.metric("Growth Rate Used", f"{r['growth_rate']:.1%}")
+
+                        # Forward returns
+                        fwd_cols = st.columns(3)
+                        for idx, (years_fwd, label) in enumerate([
+                            (1, "1-Year Forward"),
+                            (2, "2-Year Forward"),
+                            (3, "3-Year Forward"),
+                        ]):
+                            fwd_ret = r.get(f"fwd_return_{years_fwd}y")
+                            fwd_price = r.get(f"fwd_price_{years_fwd}y")
+                            correct = r.get(f"signal_correct_{years_fwd}y")
+
+                            if fwd_ret is not None:
+                                correctness = "✅" if correct else "❌"
+                                fwd_cols[idx].metric(
+                                    f"{label} {correctness}",
+                                    f"${fwd_price:,.2f}",
+                                    delta=f"{fwd_ret:+.1f}%",
+                                )
+                            else:
+                                fwd_cols[idx].metric(label, "—", help="Future data not yet available")
+
+                # ---- Charts ----
+                st.subheader("📊 Visual Comparison")
+
+                bt_fig = create_backtest_chart(backtest_results, ticker)
+                st.plotly_chart(bt_fig, use_container_width=True)
+
+                fwd_fig = create_forward_returns_chart(backtest_results, ticker)
+                st.plotly_chart(fwd_fig, use_container_width=True)
+
+                # ---- Signal Scorecard Summary ----
+                st.subheader("🏆 Signal Scorecard")
+
+                for years_fwd in [1, 2, 3]:
+                    key = f"signal_correct_{years_fwd}y"
+                    verdicts = [r[key] for r in backtest_results if r.get(key) is not None]
+                    if verdicts:
+                        correct_count = sum(verdicts)
+                        total_count = len(verdicts)
+                        hit_rate = correct_count / total_count * 100
+
+                        # Average return when model said "Undervalued" vs "Overvalued"
+                        buy_returns = [
+                            r[f"fwd_return_{years_fwd}y"]
+                            for r in backtest_results
+                            if r["signal"] == "Undervalued" and r.get(f"fwd_return_{years_fwd}y") is not None
+                        ]
+                        sell_returns = [
+                            r[f"fwd_return_{years_fwd}y"]
+                            for r in backtest_results
+                            if r["signal"] == "Overvalued" and r.get(f"fwd_return_{years_fwd}y") is not None
+                        ]
+
+                        avg_buy = f"{np.mean(buy_returns):+.1f}%" if buy_returns else "N/A"
+                        avg_sell = f"{np.mean(sell_returns):+.1f}%" if sell_returns else "N/A"
+
+                        color = "green" if hit_rate >= 50 else "red"
+                        st.markdown(
+                            f"**{years_fwd}-Year Horizon:** {correct_count}/{total_count} correct "
+                            f"(:{color}[**{hit_rate:.0f}% hit rate**]) · "
+                            f"Avg return when \"Buy\": {avg_buy} · "
+                            f"Avg return when \"Sell\": {avg_sell}"
+                        )
+
+                if not any(r.get("signal_correct_1y") is not None for r in backtest_results):
+                    st.info("Not enough forward price data available to score signals.")
+
+        # ---- TAB 4: APPENDIX (full step-by-step walkthrough) ----
         with tab_appendix:
             appendix_md = generate_appendix(
                 company_name=company_name,
