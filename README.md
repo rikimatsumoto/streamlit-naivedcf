@@ -1,4 +1,4 @@
-# 📊 DCF Analyzer — Discounted Cash Flow Web App
+# Automated Discounted Cash Flow Web App
 
 A Python/Streamlit web app that automatically calculates the intrinsic value of any publicly traded company using a simple Discounted Cash Flow model.
 
@@ -24,7 +24,7 @@ streamlit run app.py
 
 The app opens at `http://localhost:8501`.
 
-## How It Works
+## how does it work?
 
 The app follows a standard DCF process:
 
@@ -36,7 +36,7 @@ The app follows a standard DCF process:
 6. **Sensitivity Analysis** — Shows how valuation changes across different assumptions
 7. **Historical DCF Replay** - core backtest with 1/2/3-year forward returns
 
-## Features
+## features
 
 - Works with any Yahoo Finance ticker (US and international)
 - Adjustable assumptions via sidebar controls
@@ -45,7 +45,7 @@ The app follows a standard DCF process:
 - Color-coded sensitivity table
 - Handles edge cases (negative FCF, missing data, etc.)
 
-## Key Assumptions to Understand
+## key assumptions to understand
 
 | Parameter | What It Means | Typical Range |
 |-----------|---------------|---------------|
